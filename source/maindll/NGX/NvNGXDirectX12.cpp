@@ -27,7 +27,7 @@ NGXDLLEXPORT NGXResult NVSDK_NGX_D3D12_CreateFeature(
 		return 0xBAD00002;
 
 	// Grab NGX parameters from sl.dlss_g.dll
-	// https://forums.developer.nvidia.com/t/using-dlssg-without-idxgiswapchain-present/247260/8?u=user81906
+	// https://forums.developer.nvidia.com/t/using-dlssg-without-idxgiswapchain-present/247260/8
 	Parameters->Set4("DLSSG.MustCallEval", 1);
 
 	uint32_t swapchainWidth = 0;
@@ -86,6 +86,9 @@ NGXDLLEXPORT NGXResult NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCommandList
 
 	switch (status)
 	{
+	case FFX_EOF:
+		return NGX_INVALID_PARAMETER;
+
 	case FFX_OK:
 	{
 		static bool once = [&]()
@@ -189,7 +192,7 @@ NGXDLLEXPORT NGXResult NVSDK_NGX_D3D12_Init_Ext(void *Unknown1, const wchar_t *P
 	if (hasPresentMeteringAPI())
 		spdlog::info("Present metering interface is available.");
 	else
-		spdlog::info("Present metering interface is unimplemented.");
+		spdlog::info("Present metering interface is unimplemented. This is not an error.");
 
 	return NGX_SUCCESS;
 }

@@ -4,10 +4,22 @@
 #include "FFFrameInterpolator.h"
 #include "Util.h"
 
+bool g_EnableDebugOverlay = false;
+bool g_EnableDebugTearLines = false;
+bool g_EnableInterpolatedFramesOnly = false;
+
+extern "C" void __declspec(dllexport) RefreshGlobalConfiguration()
+{
+	g_EnableDebugOverlay = Util::GetSetting(L"EnableDebugOverlay", false);
+	g_EnableDebugTearLines = Util::GetSetting(L"EnableDebugTearLines", false);
+	g_EnableInterpolatedFramesOnly = Util::GetSetting(L"EnableInterpolatedFramesOnly", false);
+}
+
 FFFrameInterpolator::FFFrameInterpolator(uint32_t OutputWidth, uint32_t OutputHeight)
 	: m_SwapchainWidth(OutputWidth),
 	  m_SwapchainHeight(OutputHeight)
 {
+	RefreshGlobalConfiguration();
 }
 
 FFFrameInterpolator::~FFFrameInterpolator()
@@ -44,12 +56,8 @@ FfxErrorCode FFFrameInterpolator::Dispatch(void *CommandList, NGXInstanceParamet
 		if (!BuildFrameInterpolationParameters(&fsrFiDispatchDesc, NGXParameters))
 			return FFX_ERROR_INVALID_ARGUMENT;
 
-		const static bool doDebugOverlay = Util::GetSetting(L"Debug", L"EnableDebugOverlay", false);
-		const static bool doDebugTearLines = Util::GetSetting(L"Debug", L"EnableDebugTearLines", false);
-		const static bool doInterpolatedOnly = Util::GetSetting(L"Debug", L"EnableInterpolatedFramesOnly", false);
-
-		fsrFiDispatchDesc.DebugView = doDebugOverlay;
-		fsrFiDispatchDesc.DebugTearLines = doDebugTearLines;
+		fsrFiDispatchDesc.DebugView = g_EnableDebugOverlay;
+		fsrFiDispatchDesc.DebugTearLines = g_EnableDebugTearLines;
 
 		// Record commands
 		if (auto status = ffxOpticalflowContextDispatch(&m_OpticalFlowContext.value(), &fsrOfDispatchDesc); status != FFX_OK)
@@ -58,16 +66,27 @@ FfxErrorCode FFFrameInterpolator::Dispatch(void *CommandList, NGXInstanceParamet
 		if (auto status = m_FrameInterpolatorContext->Dispatch(fsrFiDispatchDesc); status != FFX_OK)
 			return status;
 
-		if (fsrFiDispatchDesc.DebugView || doInterpolatedOnly)
+		if (fsrFiDispatchDesc.DebugView || g_EnableInterpolatedFramesOnly)
 			gameBackBufferResource = fsrFiDispatchDesc.OutputInterpolatedColorBuffer;
 
 		return FFX_OK;
 	}();
 
-	if (dispatchStatus == FFX_OK && gameRealOutputResource.resource && gameBackBufferResource.resource)
-		CopyTexture(GetActiveCommandList(), &gameRealOutputResource, &gameBackBufferResource);
+	if ((dispatchStatus == FFX_OK || dispatchStatus == FFX_EOF) && gameBackBufferResource.resource)
+	{
+		if (gameRealOutputResource.resource)
+			CopyTexture(GetActiveCommandList(), &gameRealOutputResource, &gameBackBufferResource);
 
-	return dispatchStatus;
+		if (dispatchStatus == FFX_EOF) // Flush required and no commands were queued. Still have to prevent flickering.
+		{
+			FfxResource outputInterp = {};
+
+			if (LoadTextureFromNGXParameters(NGXParameters, "DLSSG.OutputInterpolated", &outputInterp, FFX_RESOURCE_STATE_UNORDERED_ACCESS))
+				CopyTexture(GetActiveCommandList(), &outputInterp, &gameBackBufferResource);
+		}
+	}
+
+ 	return dispatchStatus;
 }
 
 void FFFrameInterpolator::Create(NGXInstanceParameters *NGXParameters)
@@ -78,7 +97,12 @@ void FFFrameInterpolator::Create(NGXInstanceParameters *NGXParameters)
 	if (CreateOpticalFlowContext() != FFX_OK)
 		throw std::runtime_error("Failed to create optical flow context.");
 
-	m_FrameInterpolatorContext.emplace(m_FrameInterpolationBackendInterface, m_SwapchainWidth, m_SwapchainHeight);
+	m_FrameInterpolatorContext.emplace(
+		m_FrameInterpolationBackendInterface,
+		m_SharedBackendInterface,
+		*m_SharedEffectContextId,
+		m_SwapchainWidth,
+		m_SwapchainHeight);
 }
 
 void FFFrameInterpolator::Destroy()
@@ -140,17 +164,16 @@ bool FFFrameInterpolator::CalculateResourceDimensions(NGXInstanceParameters *NGX
 	if (m_PostUpscaleRenderWidth <= 32 || m_PostUpscaleRenderHeight <= 32)
 		return false;
 
-	// I've no better place to put this. Dying Light 2 is beyond screwed up.
 	//
-	// 1. They take a D24 depth buffer and explicitly convert it to RGBA8. The GBA channels are unused. This
-	//    is passed to Streamline as the "depth" buffer.
+	// At some point in time a Dying Light 2 patch fixed its depth resource issue. The game now passes
+	// the correct resource to Streamline. Prior to this, depth was being converted to RGBA8.
 	//
-	// 2. They take the same RGBA8 "depth" buffer above and pass it to Streamline as the "HUD-less" color
-	//    buffer.
+	// On the other hand DL2's HUD-less resource is still screwed up. There appears to be two separate
+	// typos (copy-paste?) resulting in depth being bound as HUD-less. Manually patching game code
+	// (x86 instructions) is an effective workaround but comes with a catch: DL2's actual "HUDLESS"
+	// resource is untonemapped and therefore unusable in FSR FG.
 	//
-	// How's it possible to be this incompetent? Have these people used a debugger? The debug visualizer? For
-	// all I know the native DLSS-G implementation doesn't even work. It could just be duplicating frames.
-	const static auto isDyingLight2 = GetModuleHandleW(L"DyingLightGame_x64_rwdi.exe") != nullptr;
+	const static bool isDyingLight2 = GetModuleHandleW(L"DyingLightGame_x64_rwdi.exe") != nullptr;
 
 	if (isDyingLight2)
 	{
@@ -280,16 +303,45 @@ bool FFFrameInterpolator::BuildFrameInterpolationParameters(
 	if (!LoadTextureFromNGXParameters(NGXParameters, "DLSSG.MVecs", &desc.InputMotionVectors, FFX_RESOURCE_STATE_COPY_DEST))
 		return false;
 
+	if (LoadTextureFromNGXParameters(NGXParameters, "DLSSG.BidirectionalDistortionField", &desc.InputDistortionField, FFX_RESOURCE_STATE_COPY_DEST))
+	{
+		const bool isLowRes = NGXParameters->GetUIntOrDefault("DLSSG.BidirectionalDistortionFieldLowPrecision.IsLowPrecision", 0) != 0;
+
+		if (isLowRes)
+		{
+			desc.InputDistortionField = {};
+
+			const static bool once = []()
+			{
+				// Not going to bother until I find a game using linear transforms
+				spdlog::warn("Attempted to use an unsupported low precision distortion field resource. Discarding.");
+				return true;
+			}();
+		}
+
+		// Subrect extents are skipped because FFX doesn't actually support them
+		// DLSSG.BidirectionalDistortionFieldSubrectWidth, DLSSG.BidirectionalDistortionFieldSubrectHeight
+	}
+
 	desc.InputOpticalFlowVector = m_SharedBackendInterface.fpGetResource(&m_SharedBackendInterface, *m_TexSharedOpticalFlowVector);
 	desc.InputOpticalFlowSceneChangeDetection = m_SharedBackendInterface.fpGetResource(&m_SharedBackendInterface, *m_TexSharedOpticalFlowSCD);
 
 	desc.OpticalFlowScale = { 1.0f / m_PostUpscaleRenderWidth, 1.0f / m_PostUpscaleRenderHeight };
 	desc.OpticalFlowBlockSize = 8;
 
-	const FfxDimensions2D mvecExtents = {
-		NGXParameters->GetUIntOrDefault("DLSSG.MVecsSubrectWidth", desc.InputMotionVectors.description.width),
-		NGXParameters->GetUIntOrDefault("DLSSG.MVecsSubrectHeight", desc.InputMotionVectors.description.height),
+	FfxDimensions2D mvecExtents = {
+		NGXParameters->GetUIntOrDefault("DLSSG.MVecsSubrectWidth", 0),
+		NGXParameters->GetUIntOrDefault("DLSSG.MVecsSubrectHeight", 0),
 	};
+
+	if (mvecExtents.width == 0 ||
+		mvecExtents.width > desc.InputMotionVectors.description.width ||
+		mvecExtents.height == 0 ||
+		mvecExtents.height > desc.InputMotionVectors.description.height)
+	{
+		mvecExtents.width = desc.InputMotionVectors.description.width;
+		mvecExtents.height = desc.InputMotionVectors.description.height;
+	}
 
 	desc.MotionVectorsFullResolution = m_PostUpscaleRenderWidth == mvecExtents.width && m_PostUpscaleRenderHeight == mvecExtents.height;
 	desc.MotionVectorJitterCancellation = NGXParameters->GetUIntOrDefault("DLSSG.MvecJittered", 0) != 0;
@@ -309,16 +361,99 @@ bool FFFrameInterpolator::BuildFrameInterpolationParameters(
 	desc.DepthInverted = NGXParameters->GetUIntOrDefault("DLSSG.DepthInverted", 0) != 0;
 	desc.Reset = NGXParameters->GetUIntOrDefault("DLSSG.Reset", 0) != 0;
 
-	// Games require a deg2rad fixup because...reasons
-	// TODO: RTX Remix games pass in a FOV of 0. FSR FG doesn't care.
-	desc.CameraFovAngleVertical = NGXParameters->GetFloatOrDefault("DLSSG.CameraFOV", 0);
+	auto loadCameraMatrix = [&]()
+	{
+		const bool isOrthographicProjection = NGXParameters->GetUIntOrDefault("DLSSG.OrthoProjection", 0) != 0;
 
-	if (desc.CameraFovAngleVertical > 10.0f)
-		desc.CameraFovAngleVertical *= std::numbers::pi_v<float> / 180.0f;
+		if (isOrthographicProjection)
+			return false;
 
-	desc.CameraNear = NGXParameters->GetFloatOrDefault("DLSSG.CameraNear", 0);
-	desc.CameraFar = NGXParameters->GetFloatOrDefault("DLSSG.CameraFar", 0);
-	desc.ViewSpaceToMetersFactor = 1.0f;
+		float(*cameraViewToClip)[4] = nullptr;
+		NGXParameters->GetVoidPointer("DLSSG.CameraViewToClip", reinterpret_cast<void **>(&cameraViewToClip));
+
+		if (!cameraViewToClip)
+			return false;
+
+		float projMatrix[4][4];
+		memcpy(projMatrix, cameraViewToClip, sizeof(projMatrix));
+
+		// BUG: Various RTX Remix-based games pass in an identity matrix which is completely useless. No
+		// idea why.
+		const bool isEmptyOrIdentityMatrix = [&]()
+		{
+			float m[4][4] = {};
+			if (memcmp(projMatrix, m, sizeof(m)) == 0)
+				return true;
+
+			m[0][0] = m[1][1] = m[2][2] = m[3][3] = 1.0f;
+			return memcmp(projMatrix, m, sizeof(m)) == 0;
+		}();
+
+		if (isEmptyOrIdentityMatrix)
+			return false;
+
+		// BUG: Indiana Jones and the Great Circle passes in what appears to be column-major matrices.
+		// Streamline expects row-major and so do we.
+		const static bool isTheGreatCircle = GetModuleHandleW(L"TheGreatCircle.exe") != nullptr;
+
+		for (int i = 0; i < 4 && isTheGreatCircle; i++)
+		{
+			for (int j = i + 1; j < 4; j++)
+				std::swap(projMatrix[i][j], projMatrix[j][i]);
+		}
+
+		// a 0 0 0
+		// 0 b 0 0
+		// 0 0 c e
+		// 0 0 d 0
+		const double b = projMatrix[1][1];
+		const double c = projMatrix[2][2];
+		const double d = projMatrix[3][2];
+		const double e = projMatrix[2][3];
+
+		if (e < 0.0)
+		{
+			desc.CameraNear = static_cast<float>((c == 0.0) ? 0.0 : (d / c));
+			desc.CameraFar = static_cast<float>(d / (c + 1.0));
+		}
+		else
+		{
+			desc.CameraNear = static_cast<float>((c == 0.0) ? 0.0 : (-d / c));
+			desc.CameraFar = static_cast<float>(-d / (c - 1.0));
+		}
+
+		if (desc.DepthInverted)
+			std::swap(desc.CameraNear, desc.CameraFar);
+
+		desc.CameraFovAngleVertical = static_cast<float>(2.0 * std::atan(1.0 / b));
+		return true;
+	};
+
+	if (!loadCameraMatrix())
+	{
+		// Some games pass in CameraFOV as degrees. Some games pass in CameraFOV as radians. Which is
+		// correct? Who knows. I sure as hell don't.
+		desc.CameraFovAngleVertical = NGXParameters->GetFloatOrDefault("DLSSG.CameraFOV", 0.0f);
+
+		// BUG: RTX Remix-based games pass in a FOV of 0. This is a kludge.
+		if (desc.CameraFovAngleVertical == 0.0f)
+			desc.CameraFovAngleVertical = 90.0f;
+
+		if (desc.CameraFovAngleVertical > 10.0f)
+			desc.CameraFovAngleVertical *= std::numbers::pi_v<float> / 180.0f;
+
+		desc.CameraNear = NGXParameters->GetFloatOrDefault("DLSSG.CameraNear", 0.0f);
+		desc.CameraFar = NGXParameters->GetFloatOrDefault("DLSSG.CameraFar", 0.0f);
+	}
+
+	if (desc.CameraNear != 0.0f && desc.CameraFar == 0.0f)
+	{
+		// A CameraFar value of zero indicates an infinite far plane. Due to a bug in FSR's
+		// setupDeviceDepthToViewSpaceDepthParams function, CameraFar must always be greater than
+		// CameraNear when in use.
+		desc.DepthPlaneInfinite = true;
+		desc.CameraFar = desc.CameraNear + 1.0f;
+	}
 
 	desc.MinMaxLuminance = m_HDRLuminanceRange;
 
@@ -339,7 +474,11 @@ FfxErrorCode FFFrameInterpolator::CreateBackend(NGXInstanceParameters *NGXParame
 	if (status != FFX_OK)
 		return status;
 
-	status = m_SharedBackendInterface.fpCreateBackendContext(&m_SharedBackendInterface, nullptr, &m_SharedEffectContextId.emplace());
+	status = m_SharedBackendInterface.fpCreateBackendContext(
+		&m_SharedBackendInterface,
+		FFX_EFFECT_FRAMEINTERPOLATION,
+		nullptr,
+		&m_SharedEffectContextId.emplace());
 
 	if (status != FFX_OK)
 	{

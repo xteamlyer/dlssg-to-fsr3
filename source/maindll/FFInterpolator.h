@@ -13,6 +13,7 @@ struct FFInterpolatorDispatchParameters
     FfxResource InputHUDLessColorBuffer;
     FfxResource InputDepth;
     FfxResource InputMotionVectors;
+	FfxResource InputDistortionField;
 
     FfxResource InputOpticalFlowVector;
     FfxResource InputOpticalFlowSceneChangeDetection;
@@ -30,6 +31,7 @@ struct FFInterpolatorDispatchParameters
 
 	bool HDR;
 	bool DepthInverted;
+	bool DepthPlaneInfinite;
 	bool Reset;
 	bool DebugTearLines;
 	bool DebugView;
@@ -37,7 +39,6 @@ struct FFInterpolatorDispatchParameters
     float CameraNear;
 	float CameraFar;
 	float CameraFovAngleVertical;
-    float ViewSpaceToMetersFactor;
 	FfxFloatCoords2D MinMaxLuminance;
 };
 
@@ -48,16 +49,24 @@ private:
 	const uint32_t m_MaxRenderHeight;
 
 	const FfxInterface m_BackendInterface;
+	FfxInterface m_SharedBackendInterface;
+	FfxUInt32 m_SharedEffectContextId = {};
+
+	FfxFrameInterpolationContextDescription m_ContextDescription = {};
 	std::optional<FfxFrameInterpolationContext> m_FSRContext;
+	bool m_ContextFlushPending = false;
 
-	FfxSurfaceFormat m_InitialBackBufferFormat = {};
-	std::optional<FfxResourceInternal> m_InitialPreviousInterpolationSource;
-
-	FfxSurfaceFormat m_BackupBackBufferFormat = {};
-	std::optional<FfxResourceInternal> m_BackupPreviousInterpolationSource;
+	std::optional<FfxResourceInternal> m_DilatedDepth;
+	std::optional<FfxResourceInternal> m_DilatedMotionVectors;
+	std::optional<FfxResourceInternal> m_ReconstructedPrevDepth;
 
 public:
-	FFInterpolator(const FfxInterface& BackendInterface, uint32_t MaxRenderWidth, uint32_t MaxRenderHeight);
+	FFInterpolator(
+		const FfxInterface& BackendInterface,
+		const FfxInterface& SharedBackendInterface,
+		FfxUInt32 SharedEffectContextId,
+		uint32_t MaxRenderWidth,
+		uint32_t MaxRenderHeight);
 	FFInterpolator(const FFInterpolator&) = delete;
 	FFInterpolator& operator=(const FFInterpolator&) = delete;
 	~FFInterpolator();
@@ -65,6 +74,6 @@ public:
 	FfxErrorCode Dispatch(const FFInterpolatorDispatchParameters& Parameters);
 
 private:
-	FfxErrorCode InternalDeferredSetupContext(const FFInterpolatorDispatchParameters& Parameters);
-	FfxErrorCode InternalSwapResources(FfxSurfaceFormat NewFormat);
+	FfxErrorCode CreateContextDeferred(const FFInterpolatorDispatchParameters& Parameters);
+	void DestroyContext();
 };

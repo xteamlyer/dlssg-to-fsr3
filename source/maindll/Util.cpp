@@ -55,10 +55,15 @@ namespace Util
 		}();
 	}
 
-	bool GetSetting(const wchar_t *Category, const wchar_t *Key, bool Default)
+	bool GetSetting(const wchar_t *Key, bool DefaultValue)
 	{
-		const static auto iniPath = GetThisDllPath() + L"\\dlssg_to_fsr3.ini";
+		wchar_t envKey[256];
+		swprintf_s(envKey, L"DLSSGTOFSR3_%s", Key);
 
-		return GetPrivateProfileIntW(Category, Key, Default, iniPath.c_str()) != 0;
+		if (wchar_t v[2]; GetEnvironmentVariableW(envKey, v, std::size(v)) == 1)
+			return v[0] == L'1';
+
+		const static auto iniPath = GetThisDllPath() + L"\\dlssg_to_fsr3.ini";
+		return GetPrivateProfileIntW(L"Debug", Key, DefaultValue, iniPath.c_str()) != 0;
 	}
 }
