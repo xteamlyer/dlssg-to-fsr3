@@ -1,4 +1,5 @@
 #include <Windows.h>
+#include <array>
 #include "NvNGX.h"
 
 __declspec(noinline) void *GetImplementationDll()
@@ -14,7 +15,7 @@ __declspec(noinline) void *GetImplementationDll()
 			reinterpret_cast<LPCWSTR>(&GetImplementationDll),
 			&thisModuleHandle);
 
-		if (GetModuleFileNameW(thisModuleHandle, path, ARRAYSIZE(path)))
+		if (GetModuleFileNameW(thisModuleHandle, path, std::size(path)))
 		{
 			// Chop off the file name
 			for (auto i = static_cast<ptrdiff_t>(wcslen(path)) - 1; i > 0; i--)
@@ -31,7 +32,7 @@ __declspec(noinline) void *GetImplementationDll()
 		const auto mod = LoadLibraryW(path);
 
 		if (!mod)
-			MessageBoxW(nullptr, path, L"dlssg-to-fsr3 failed to load implementation DLL.", MB_ICONERROR);
+			MessageBoxW(nullptr, path, L"dlssg-to-fsr3 failed to load implementation library.", MB_ICONERROR);
 
 		return mod;
 	}();
